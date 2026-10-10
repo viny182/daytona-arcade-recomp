@@ -15,9 +15,11 @@ struct Screen { float2 size; float2 pad; }; // the render target, in pixels
 // polygon's texture state, decoded on the CPU as render_one does:
 //   info.x: renderer (bits 0-1), checker 2, wrap x 3, wrap y 4, mirror x 5,
 //           mirror y 6, microtexture 7, its min LOD 8-9, sheets swapped 10,
-//           max mip level 12-16, log2(width / 32) 17-19, log2(height / 32) 20-22
+//           max mip level 12-16, log2(width / 32) 17-19, log2(height / 32) 20-22,
+//           texture pack picture 23, its mode 24-27 (gpu/texpack.h)
 //   info.y: texx | texy << 16      info.z: utexx | utexy << 16
-//   info.w: lumabase | luma << 16  more.x: texlod (int)  more.y: palette colour (RGB555)
+//   info.w: lumabase | luma << 16  more.x: texlod (int)  more.y: palette colour (RGB555),
+//           with a texture pack picture also its light (0..63) << 16
 struct PolyIn {
     float2 pos : TEXCOORD0;
     float depth : TEXCOORD1;
@@ -44,13 +46,18 @@ PolyOut vs_poly(PolyIn i) {
     return o;
 }
 
-// Fragment data (read-only storage buffers, space2, as SDL_GPU orders them):
-// texture RAM (sheet 0 then sheet 1, 0x80000 dwords each, as the rasterizer
-// reads them), the luma RAM (one entry per dword, low byte), and the colour
-// translation table with the rasterizer's gamma already applied.
-[[vk::binding(0, 2)]] StructuredBuffer<uint> texram : register(t0, space2);
-[[vk::binding(1, 2)]] StructuredBuffer<uint> lumaram : register(t1, space2);
-[[vk::binding(2, 2)]] StructuredBuffer<uint> xlat : register(t2, space2);
+// Fragment data (read-only storage buffers, space2, as SDL_GPU orders them,
+// after the texture pack's sampler): texture RAM (sheet 0 then sheet 1,
+// 0x80000 dwords each, as the rasterizer reads them), the luma RAM (one entry
+// per dword, low byte), and the colour translation table with the
+// rasterizer's gamma already applied.
+[[vk::binding(1, 2)]] StructuredBuffer<uint> texram : register(t1, space2);
+[[vk::binding(2, 2)]] StructuredBuffer<uint> lumaram : register(t2, space2);
+[[vk::binding(3, 2)]] StructuredBuffer<uint> xlat : register(t3, space2);
+// A texture pack's picture for this draw's polygons (a 1x1 one when they have
+// none); SDL_GPU numbers the sampler before the storage buffers.
+[[vk::combinedImageSampler]] [[vk::binding(0, 2)]] Texture2D<float4> pack_tex : register(t0, space2);
+[[vk::combinedImageSampler]] [[vk::binding(0, 2)]] SamplerState pack_smp : register(s0, space2);
 
 static const uint log2_table[128] = {0, 2, 5, 8, 11, 14, 16, 19, 22, 25, 27, 30, 33, 35, 38, 40, 43, 46, 48, 51, 53, 56, 58, 61, 63, 65, 68, 70, 73, 75, 77, 80, 82, 84, 87, 89, 91, 93, 96, 98, 100, 102, 104, 106, 109, 111, 113, 115, 117, 119, 121, 123, 125, 127, 129, 132, 134, 136, 138, 140, 141, 143, 145, 147, 149, 151, 153, 155, 157, 159, 161, 162, 164, 166, 168, 170, 172, 173, 175, 177, 179, 181, 182, 184, 186, 188, 189, 191, 193, 194, 196, 198, 200, 201, 203, 205, 206, 208, 209, 211, 213, 214, 216, 218, 219, 221, 222, 224, 225, 227, 229, 230, 232, 233, 235, 236, 238, 239, 241, 242, 244, 245, 247, 248, 250, 251, 253, 254};
 
@@ -151,6 +158,12 @@ uint fetch_texel(uint4 info, int level, int u, int v, bool translucent) {
     return lerp8(t0x, t1x, vfrac);
 }
 
+// How much a coloured picture of a texture pack is lit, by its mode: the
+// brightness the emulators' mode_N.ps pixel shaders multiply a picture by
+// (mode 1: 1.1 x light; 2..4: 2, 1.5, 1.3 x; 5: 1.5 x 0.9; 6: 4 x 0.34;
+// 7: 4 x 0.6; 14: 2 x).
+static const float pack_gain[16] = {1.0, 1.1, 2.0, 1.5, 1.3, 1.35, 1.36, 2.4, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 2.0, 1.0};
+
 float4 ps_poly(PolyOut i) : SV_Target {
     const uint flags = i.info.x;
     if ((flags >> 2) & 1u) { // checker: the rasterizer draws pixels with (x ^ y) odd
@@ -168,23 +181,63 @@ float4 ps_poly(PolyOut i) : SV_Target {
     const int level = clamp(mml >> 7, 0, max_level);
     const int u = to_s32(i.oz.y * z * 256.0);
     const int v = to_s32(i.oz.z * z * 256.0);
-    uint t = fetch_texel(i.info, level, u, v, translucent);
-    if (mml > 0 && level < max_level) {
-        const uint t2 = fetch_texel(i.info, level + 1, u, v, translucent);
-        t = lerp8(t, t2, uint((mml & 127) << 1));
-    } else if (((flags >> 7) & 1u) && mml < 0) {
-        const uint t2 = fetch_texel(i.info, -1, u, v, translucent);
-        t = lerp8(t, t2, uint(min(-mml >> ((flags >> 8) & 3u), 127)));
+
+    // A texture pack's picture stands where the game's texture is: the same
+    // position in it (u, v at level 0, mirrored as the rasterizer does),
+    // filtered by the GPU. Its derivatives are taken here, before any branch.
+    const float tw = float(32u << ((flags >> 17) & 7u)), th = float(32u << ((flags >> 20) & 7u));
+    int mu = u, mv = v;
+    if (((flags >> 5) & 1u) && (mu & int(uint(tw) << 8)) != 0) mu = ~mu;
+    if (((flags >> 6) & 1u) && (mv & int(uint(th) << 8)) != 0) mv = ~mv;
+    const float2 puv = float2(float(mu) / (256.0 * tw), float(mv) / (256.0 * th));
+    const float2 pdx = ddx(puv), pdy = ddy(puv);
+    const bool pack = ((flags >> 23) & 1u) != 0u;
+    float4 pic = float4(0.0, 0.0, 0.0, 1.0);
+    if (pack) {
+        float2 size;
+        pack_tex.GetDimensions(size.x, size.y);
+        // The rasterizer wraps addresses by the texture's size whatever the wrap
+        // bits (3, 4) say; they only stop the edge texels blending with the far
+        // edge. So: repeat, and where the polygon doesn't wrap and stays inside
+        // the picture, hold to its edge texel.
+        float2 c = puv;
+        if (((flags >> 3) & 1u) == 0u && c.x >= 0.0 && c.x <= 1.0) c.x = clamp(c.x, 0.5 / size.x, 1.0 - 0.5 / size.x);
+        if (((flags >> 4) & 1u) == 0u && c.y >= 0.0 && c.y <= 1.0) c.y = clamp(c.y, 0.5 / size.y, 1.0 - 0.5 / size.y);
+        pic = pack_tex.SampleGrad(pack_smp, c, pdx, pdy);
+        if (pic.a < 0.5) discard;
     }
-    if (translucent) {
-        if (t < 0x00400000u) discard;
-        t &= 0xffu;
+
+    uint t;
+    if (pack) {
+        t = uint(pic.r * 255.0 + 0.5); // a grayscale picture is the game's texture, in 8 bits
+    } else {
+        t = fetch_texel(i.info, level, u, v, translucent);
+        if (mml > 0 && level < max_level) {
+            const uint t2 = fetch_texel(i.info, level + 1, u, v, translucent);
+            t = lerp8(t, t2, uint((mml & 127) << 1));
+        } else if (((flags >> 7) & 1u) && mml < 0) {
+            const uint t2 = fetch_texel(i.info, -1, u, v, translucent);
+            t = lerp8(t, t2, uint(min(-mml >> ((flags >> 8) & 3u), 127)));
+        }
+        if (translucent) {
+            if (t < 0x00400000u) discard;
+            t &= 0xffu;
+        }
     }
     const uint lumabase = i.info.w & 0xffffu, pluma = i.info.w >> 16;
+    const uint c = i.more.y & 0x7fffu;
+    const uint cr = ((c >> 0) & 0x1fu) << 8, cg = 0x2000u + (((c >> 5) & 0x1fu) << 8), cb = 0x4000u + (((c >> 10) & 0x1fu) << 8);
+    const uint mode = (flags >> 24) & 15u;
+    if (pack && mode != 0u) {
+        // A coloured picture: lit as the polygon's brightest texel is (the CPU
+        // took its luma table's peak, bits 16..21 of more.y), through the colour
+        // table: the brightest channel, times the mode's gain.
+        const uint wl = (i.more.y >> 16) & 0x3fu;
+        const float light = max(max(float(xlat[cr + wl]), float(xlat[cg + wl])), float(xlat[cb + wl])) / 255.0;
+        return float4(saturate(pic.rgb * (light * pack_gain[mode])), 1.0);
+    }
     uint luma = ((lumaram[lumabase + (t >> 1)] & 0xffu) * pluma / 256u) & 0xffu;
     luma = min(luma, 0x3fu);
-    const uint c = i.more.y;
-    const uint cr = ((c >> 0) & 0x1fu) << 8, cg = 0x2000u + (((c >> 5) & 0x1fu) << 8), cb = 0x4000u + (((c >> 10) & 0x1fu) << 8);
     return float4(float(xlat[cr + luma]) / 255.0, float(xlat[cg + luma]) / 255.0, float(xlat[cb + luma]) / 255.0, 1.0);
 }
 

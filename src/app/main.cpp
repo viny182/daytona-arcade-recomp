@@ -177,6 +177,14 @@ void open_log() {
 #endif
 }
 
+// The names a texture pack's .pat file may go by for this ROM set: the pack's
+// own (the Model 2 emulator's name for the 1993 set, and the 1994 set's, which
+// the 1993 set's textures are mostly shared with).
+static std::vector<std::string> pack_sets() {
+    if (std::string(M2_ROMSET) == "daytona93") return {"dayton93", "daytona93", "daytona"};
+    return {M2_ROMSET};
+}
+
 int main(int argc, char **argv) {
     for (int i = 1; i + 1 < argc; i++) // before anything reads or writes the data folder
         if (!std::strcmp(argv[i], "--profile")) app::Config::profile = argv[i + 1];
@@ -196,6 +204,7 @@ int main(int argc, char **argv) {
             cfg.native_audio = !std::strcmp(argv[++i], "native");
         }
         else if (!std::strcmp(argv[i], "--frames") && i + 1 < argc) max_frames = std::strtoull(argv[++i], nullptr, 10);
+        else if (!std::strcmp(argv[i], "--texture-pack") && i + 1 < argc) cfg.texture_pack = argv[++i], cfg.texture_pack_on = true;
         else if (!std::strcmp(argv[i], "--fullscreen")) cfg.fullscreen = true;
         else if (!std::strcmp(argv[i], "--autostart")) autostart = true;
         else if (!std::strcmp(argv[i], "--profile") && i + 1 < argc) ++i; // read above
@@ -232,13 +241,18 @@ int main(int argc, char **argv) {
     SDL_Log("SDL %d; compiled GPU backends: %d", SDL_GetVersion(), SDL_GetNumGPUDrivers());
     for (int i = 0; i < SDL_GetNumGPUDrivers(); ++i)
         SDL_Log("GPU backend: %s", SDL_GetGPUDriver(i));
-    SDL_GPUDevice *dev = app::create_gpu_device();
+#ifdef M2_MOBILE
+    constexpr bool kAnisotropy = false;
+#else
+    constexpr bool kAnisotropy = true; // a texture pack's pictures are sampled with it
+#endif
+    SDL_GPUDevice *dev = app::create_gpu_device(kAnisotropy);
     if (!dev && !cfg.gpu.empty()) {
         // The chosen API is not available here (Vulkan on a Mac without MoltenVK): use the automatic choice.
         std::fprintf(stderr, "daytona: %s; falling back to automatic\n", SDL_GetError());
         SDL_ResetHint(SDL_HINT_GPU_DRIVER);
         cfg.gpu.clear();
-        dev = app::create_gpu_device();
+        dev = app::create_gpu_device(kAnisotropy);
     }
     if (!dev) return fail("SDL_CreateGPUDevice");
     if (!SDL_ClaimWindowForGPUDevice(dev, window)) return fail("SDL_ClaimWindowForGPUDevice");
@@ -266,9 +280,13 @@ int main(int argc, char **argv) {
 
     // Hardware renderer (launcher > Renderer): the 3D on the GPU. If it cannot
     // start here, the software renderer is used and the launcher says why.
+    app::TexPack texture_pack; // declared first: the renderer holds a pointer to it
+    std::string pack_folder;   // the folder it was loaded from, "" for none
     app::GpuRenderer gpu;
     if (!gpu.init(dev, SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM))
         std::fprintf(stderr, "daytona: hardware renderer unavailable: %s\n", gpu.error().c_str());
+    else if (kAnisotropy)
+        gpu.set_pack_anisotropy(16.0f);
 
     SDL_GPUTextureCreateInfo ti{};
     ti.type = SDL_GPU_TEXTURETYPE_2D;
@@ -543,6 +561,26 @@ int main(int argc, char **argv) {
         } else {
             pacer.pause(now);
             ffb.stop(); // paused in the launcher: let the wheel go
+        }
+
+        // Texture pack (launcher > Texture pack): (re)loaded when its folder or its switch changes.
+        const std::string want_pack = gpu.ok() && cfg.renderer == "hardware" && cfg.texture_pack_on ? cfg.texture_pack : std::string();
+        if (want_pack != pack_folder) {
+            pack_folder = want_pack;
+            std::string err;
+            if (want_pack.empty()) {
+                gpu.set_texture_pack(nullptr);
+                launcher.set_pack_status(false, "");
+            } else if (texture_pack.load(want_pack, pack_sets(), err)) {
+                gpu.set_texture_pack(&texture_pack);
+                const std::string note = std::to_string(texture_pack.size()) + " pictures from " + texture_pack.pat_path();
+                std::printf("daytona: texture pack: %s\n", note.c_str());
+                launcher.set_pack_status(true, note);
+            } else {
+                gpu.set_texture_pack(nullptr);
+                std::fprintf(stderr, "daytona: texture pack: %s\n", err.c_str());
+                launcher.set_pack_status(false, err);
+            }
         }
 
         SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(dev);

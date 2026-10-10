@@ -44,6 +44,7 @@ void apply_fullscreen_mode(SDL_Window *window, const std::string &key) {
 
 Launcher::Launcher(Config &cfg, SDL_Window *window) : cfg_(cfg), window_(window) {
     std::snprintf(link_next_buf_, sizeof link_next_buf_, "%s", cfg_.link_next.c_str());
+    std::snprintf(pack_buf_, sizeof pack_buf_, "%s", cfg_.texture_pack.c_str());
 #ifdef SDL_PLATFORM_ANDROID
     // Older mobile builds saved the picker result (content://...) directly.
     // Do not reopen such a URI during startup: Android's temporary document
@@ -117,6 +118,19 @@ void Launcher::browse() {
 #else
     SDL_ShowOpenFileDialog(dialog_done, this, window_, filters, 2, cfg_.rom_path.empty() ? nullptr : cfg_.rom_path.c_str(), false);
 #endif
+}
+
+void SDLCALL Launcher::pack_dialog_done(void *self, const char *const *folders, int) {
+    auto *l = static_cast<Launcher *>(self);
+    std::lock_guard<std::mutex> g(l->dialog_mutex_);
+    l->dialog_pending_ = false;
+    if (folders && folders[0]) l->pack_dialog_result_ = folders[0];
+    else if (!folders) l->error_ = std::string("Folder picker: ") + SDL_GetError();
+}
+
+void Launcher::browse_pack() {
+    dialog_pending_ = true;
+    SDL_ShowOpenFolderDialog(pack_dialog_done, this, window_, cfg_.texture_pack.empty() ? nullptr : cfg_.texture_pack.c_str(), false);
 }
 
 void Launcher::start_capture(int action, CaptureKind kind, const Devices &devices) {
@@ -224,6 +238,12 @@ Launcher::Result Launcher::draw(bool game_running, const Devices &devices) {
             std::snprintf(path_buf_, sizeof path_buf_, "%s", cfg_.rom_path.c_str());
             cfg_.save();
             check_rom();
+        }
+        if (!pack_dialog_result_.empty()) {
+            cfg_.texture_pack = pack_dialog_result_;
+            pack_dialog_result_.clear();
+            std::snprintf(pack_buf_, sizeof pack_buf_, "%s", cfg_.texture_pack.c_str());
+            cfg_.save();
         }
     }
 
@@ -390,6 +410,23 @@ Launcher::Result Launcher::draw(bool game_running, const Devices &devices) {
             ImGui::EndDisabled();
             ImGui::TextDisabled("Hardware renderer: the 3D drawn at 2 to 4 times the original resolution, with\n"
                                 "sharper textures; the window shows it scaled to fit, which smooths the edges.");
+#if !defined(SDL_PLATFORM_IOS) && !defined(SDL_PLATFORM_ANDROID)
+            ImGui::BeginDisabled(cfg_.renderer != "hardware");
+            if (ImGui::Checkbox("Texture pack (Experimental)", &cfg_.texture_pack_on)) cfg_.save();
+            ImGui::SetNextItemWidth(-100);
+            if (ImGui::InputText("##pack", pack_buf_, sizeof pack_buf_, ImGuiInputTextFlags_EnterReturnsTrue)) {
+                cfg_.texture_pack = pack_buf_;
+                cfg_.save();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Browse...##pack", ImVec2(90, 0)) && !dialog_pending_) browse_pack();
+            ImGui::EndDisabled();
+            if (cfg_.texture_pack_on && !pack_status_.empty())
+                ImGui::TextColored(pack_ok_ ? ImVec4(0.4f, 0.9f, 0.4f, 1) : ImVec4(1, 0.6f, 0.3f, 1), "%s", pack_status_.c_str());
+            ImGui::TextDisabled("Hardware renderer: your own texture pack replaces the game's textures with new\n"
+                                "pictures. Choose the folder with the pack's .pat file and PNG files (see\n"
+                                "docs/texture-packs.md). Off: the game's own textures.");
+#endif
 
             ImGui::Spacing();
             ImGui::Separator();

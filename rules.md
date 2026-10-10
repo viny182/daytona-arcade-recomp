@@ -3,6 +3,11 @@
 These are binding. They exist because breaking them costs a polluted history, a
 legal problem, or hours re-deriving something already established.
 
+> **Fork note.** The Git rules 1 and 2 below (no attribution, no mention of an
+> AI) are upstream's rules for contributions to upstream. This fork's texture
+> pack work was written entirely by an AI and says so in the README, at the
+> owner's request; the commits carry only the owner's name. Everything else here still applies.
+
 ---
 
 ## Git

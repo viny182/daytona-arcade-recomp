@@ -15,13 +15,22 @@
 // colour from the CPU; textured ones are shaded per pixel by a port of the
 // rasterizer's draw_tex_span (m2.hlsl) reading texture RAM, the luma RAM and
 // the colour translation from storage buffers.
+//
+// A texture pack (gpu/texpack.h, opt in) replaces textures by identity: a
+// polygon's ID pair (runtime/texid.h) names its picture, which the pixel
+// shader samples, filtered by the GPU, where it would read the game's 4-bit
+// texture. Polygons are then drawn in groups by picture; the depth test, not
+// the draw order, decides what shows, so the image is the same. With no pack,
+// or no polygon matching it, the frame is drawn exactly as without.
 #pragma once
 
+#include "app/gpu/texpack.h"
 #include "runtime/video.h"
 
 #include <SDL3/SDL.h>
 
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace app {
@@ -33,6 +42,20 @@ public:
     bool init(SDL_GPUDevice *dev, SDL_GPUTextureFormat format);
     void shutdown();
     bool ok() const { return poly_pipe_ != nullptr; }
+    // Replacement pictures for textured polygons; null turns them off. The pack
+    // must outlive its use here (or until set again). Its pictures are decoded
+    // and uploaded as polygons first need them.
+    void set_texture_pack(const TexPack *pack);
+    // Anisotropic filtering of the pack's pictures, up to `max` (1: off). Only
+    // for a device made with the anisotropy feature (app/gpu_device.h).
+    void set_pack_anisotropy(float max);
+    // How many pictures may be decoded and uploaded in one frame (default 4:
+    // decoding is a few milliseconds each; polygons without their picture yet
+    // show the game's own texture). Tools that want every frame complete raise it.
+    void set_pack_uploads_per_frame(int n) { pack_uploads_ = n; }
+    // Pictures drawn from the pack in the last frame, and resident on the GPU.
+    int pack_polygons() const { return pack_polygons_; }
+    int pack_resident() const { return pack_resident_; }
     const std::string &error() const { return error_; }
 
     // Draws the frame into `target` (at least w x h times `scale`, created
@@ -53,9 +76,19 @@ private:
     struct QuadVertex {
         float x, y, u, v;
     };
-    struct Batch { // consecutive polygons sharing one clip rectangle
+    struct Batch { // consecutive polygons sharing one clip rectangle (and one pack picture)
         uint32_t first, count;
         SDL_Rect clip;
+        int pack = -1; // the pack entry whose picture they use, or none
+    };
+    struct PolyRec { // a polygon's vertices, when a pack may regroup them
+        uint32_t first, count;
+        SDL_Rect clip;
+        int pack;
+    };
+    struct PackTexture {
+        SDL_GPUTexture *tex = nullptr;
+        bool failed = false;
     };
 
     SDL_GPUDevice *dev_ = nullptr;
@@ -80,6 +113,16 @@ private:
     uint32_t upload_size_ = 0;
     std::vector<PolyVertex> verts_;
     std::vector<Batch> batches_;
+    // texture pack
+    const TexPack *pack_ = nullptr;
+    std::vector<PackTexture> pack_tex_;     // per pack entry
+    SDL_GPUTexture *blank_ = nullptr;       // what a draw without a picture binds
+    SDL_GPUSampler *pack_sampler_ = nullptr;
+    std::vector<PolyRec> recs_;
+    std::vector<PolyVertex> regrouped_;
+    std::unordered_map<uint32_t, int> pack_ids_; // ID1 -> pack entry (or -1), for this texture RAM generation
+    uint64_t pack_ids_generation_ = ~0ull;
+    int pack_polygons_ = 0, pack_resident_ = 0, pack_uploads_ = 4;
     std::vector<size_t> order_;
     uint8_t gamma_[256];
     std::string error_;
@@ -89,6 +132,9 @@ private:
                           int storage_buffers = 0);
     bool ensure(int w, int h, int scale, uint32_t vert_bytes);
     void build(const rt::Video &video, int w, int h, int scale);
+    int pack_entry(const rt::VideoMem &mem, uint16_t th0, uint16_t th2);
+    bool pack_texture(SDL_GPUCommandBuffer *cmd, int entry);
+    void regroup(SDL_GPUCommandBuffer *cmd);
 };
 
 } // namespace app

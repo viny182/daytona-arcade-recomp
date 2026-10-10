@@ -39,6 +39,8 @@ struct Config {
     int draw_distance = 0;     // scenery: 0 = the game's own, -2..+2 (rt::Enhance)
     int draw_mode = 0;         // 0 double buffered (every frame), 1 single buffered (every 2nd), 2 every third frame
     int supersampling = 1;     // hardware renderer: drawn at 1 (off) to 4 times the original resolution
+    bool texture_pack_on = false; // hardware renderer: replacement textures from texture_pack (gpu/texpack.h)
+    std::string texture_pack;  // the pack's folder (holds <set>.pat and its PNG files)
     static constexpr double kMaxAspect = 21.0 / 9.0;
     double aspect_ratio() const; // width / height; 0 = original
     Controls controls;

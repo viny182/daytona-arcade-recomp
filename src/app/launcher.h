@@ -38,11 +38,14 @@ public:
     void set_ffb_device(const char *kind) { ffb_device_ = kind; } // what force feedback is playing on
     void set_link_status(const std::string &s) { link_status_ = s; } // link play, for the Game tab
     void set_pacing_status(const std::string &s) { pacing_status_ = s; } // frame pacing now, for the Game tab
+    void set_pack_status(bool ok, const std::string &s) { pack_ok_ = ok, pack_status_ = s; } // texture pack, for the Game tab
 
 private:
     void check_rom();
     void browse();
+    void browse_pack();
     static void SDLCALL dialog_done(void *self, const char *const *files, int filter);
+    static void SDLCALL pack_dialog_done(void *self, const char *const *folders, int filter);
 
     Config &cfg_;
     SDL_Window *window_;
@@ -54,6 +57,9 @@ private:
     std::string pacing_status_;
     char link_next_buf_[256] = {};
     char path_buf_[1024] = {};
+    char pack_buf_[1024] = {};
+    std::string pack_status_, pack_dialog_result_;
+    bool pack_ok_ = false;
 
     std::mutex dialog_mutex_;
     std::string dialog_result_;

@@ -1,4 +1,29 @@
-# Daytona USA static recompilation
+# Daytona USA static recompilation (fork with texture pack support)
+
+> **This fork was written 100% by AI, by "vibecoding".** Everything the fork
+> adds to the upstream project (the texture pack loader, the shader changes,
+> the launcher option, the tests, the docs, and the reverse engineering notes
+> below) was produced by Claude (Anthropic's AI model, through Claude Code)
+> from plain-language requests by one person who did not write or review it
+> line by line. It was tested by running it, not by a human code review. Treat
+> it as an experiment: it works on one machine (Linux, AMD iGPU, Revision A
+> set, one texture pack), and nothing else has been checked. The maintainer of
+> the original project was not asked to take it, and it is not endorsed by them.
+>
+> **Credits**
+>
+> 1. **Upstream project:** [alphanu1/daytona-arcade-recomp](https://github.com/alphanu1/daytona-arcade-recomp)
+>    by Ben Templeman and contributors. Everything that is not the texture
+>    pack feature is theirs (the recompiler, the renderers, the platforms, the
+>    launcher). This fork stays under their BSD-3-Clause licence.
+> 2. **The textures:** *Daytona USA 2019 HD Textures* by
+>    [stf999](https://www.deviantart.com/stf999/gallery/). The pack is not in
+>    this repository and not redistributed here; see
+>    [Texture packs](#texture-packs-fork-feature) for where to get it.
+> 3. **The pack format and the emulator:** ElSemi's Model 2 emulator and its
+>    `.pat` texture replacement format, which the pack is made for. The texture
+>    ID formula was checked against the pack and against that emulator's
+>    behaviour (details under [Findings](#findings-for-the-curious)).
 
 Daytona USA (Sega Model 2) rebuilt as native code: the game's i960 program
 and the TGP program it uploads are statically recompiled to portable C++,
@@ -113,7 +138,9 @@ opens first:
   is checked against the ROM set this build was recompiled from. Graphics API
   (automatic, Vulkan, Direct3D 12, Metal), Renderer (software, the exact
   CPU renderer; or hardware, on the GPU, experimental), Super sampling
-  (hardware renderer: off, or the 3D drawn at 2x to 4x the original resolution), fullscreen, hide the
+  (hardware renderer: off, or the 3D drawn at 2x to 4x the original resolution), Texture pack
+  (hardware renderer, experimental: new pictures for the game's textures from a folder
+  you supply, [docs/texture-packs.md](docs/texture-packs.md); also `--texture-pack DIR`), fullscreen, hide the
   mouse cursor in game (it shows again in the launcher), the
   fullscreen mode (borderless, or an exclusive resolution and refresh rate),
   frame pacing (all off: the arcade's own speed on any display; smooth
@@ -168,6 +195,91 @@ i960 code and runs on the native board with the YM3438 (ymfm) and both
 MultiPCMs; output goes through SDL audio. Volume, mute, and separate music
 and effects volumes are on the launcher's Audio tab.
 
+## Texture packs (fork feature)
+
+The hardware renderer can draw the game with a texture pack's pictures instead
+of the original 4-bit textures. Off by default; with it off the output is
+byte-identical to upstream's.
+
+**Get the pack** (not included here; free, by stf999). Announcement thread:
+[Daytona USA 2019 HD Textures, arcadecontrols forum](https://forum.arcadecontrols.com/index.php?topic=159441.0).
+Direct downloads (MediaFire):
+
+1. [Model 2 emulator "scripts folder" version](http://www.mediafire.com/file/pkljwpupy9blwy4/DaytonaUSA_stf999_2019_textures_%28M2_Emu_Scripts_Folder%29.zip)
+   (use this one)
+2. [Textures only](http://www.mediafire.com/file/o76qaataosek5m6/DaytonaUSA_stf999_2019_textures_only.zip/file)
+3. [Nuexzz D++ scripts folder version](http://www.mediafire.com/file/na4xxto8xuauo3j/DaytonaUSA_stf999_2019_textures_%28Nuexzz_D%2B%2B_Scripts_Folder%29.zip)
+   (for another emulator; not used here)
+
+**Use it:** unzip version 1 anywhere (you get a folder with `daytona.pat` and
+a few hundred PNG files). In the launcher choose the **hardware** renderer,
+tick **Texture pack (Experimental)** and Browse to that folder, or run
+`build/daytona --texture-pack FOLDER`. Full guide and limits:
+[docs/texture-packs.md](docs/texture-packs.md). Needs about 180 MB of GPU
+memory with the whole pack in use.
+
+## Findings for the curious
+
+What was worked out while making this, for anyone who wants to do the same
+for another game or pack. The formal version is in
+[docs/texture-packs.md](docs/texture-packs.md) and [HANDOFF.md](HANDOFF.md).
+
+1. **A `.pat` line is `ID1 ID2 mode file.png`.** ID1 is
+   `texheader[2] << 16 | texheader[0] & 0xE03F`: the texture's sheet and
+   position, its size and the renderer bits, but not the wrap, mirror,
+   microtexture or LOD bits (bits 6 to 12 never occur in a pack's IDs).
+2. **ID2 is a plain zlib CRC-32** (polynomial 0xEDB88320) of the texture's
+   *raw bytes in the texture sheet*, not of the decoded texels. It runs over
+   each pair of texel rows: `2 x width` bytes from the pair's first 16-bit
+   word, the next pair 0x400 bytes further on, `height / 2` pairs, chained.
+   The length is twice what the width needs, so the hash also covers the
+   texture's right neighbour. Sheets are 2048x1024 in the address space but
+   stored 1024x2048: for x >= 1024, subtract 1024 from x and flip bit 10 of y.
+   With this, 437 of the 437 textures drawn in a boot, attract mode and a
+   race were in the pack's `.pat`.
+3. **How ID2 was found, and the dead ends.** About 40 hash and ordering
+   combinations over the decoded texels found nothing (CRC-32, Adler, FNV,
+   sums, 105 textures whose pack picture was known by image correlation).
+   Matching pack PNGs to dumped textures by correlation gave the pairs but
+   not the function. What found it was reading the hash loop in the Model 2
+   emulator's `EMULATOR.EXE` (a freely distributed binary; no source). Only
+   the constant, the length and the stride were taken from it; no code was
+   copied. If you want to avoid the emulator entirely, the formula can be
+   re-checked against any pack's own ID pairs.
+4. **Texture RAM almost never changes** (twice in 3200 frames of attract mode
+   and a race), so IDs are computed once per texture per RAM generation and
+   cached; replacing is a table lookup per polygon.
+5. **Modes.** Mode 0 is a grayscale stand-in for the 4-bit texel, sent
+   through the game's own luma and colour tables. Modes 1 to 15 are coloured
+   pictures multiplied by the polygon's light and a per-mode gain taken from
+   the emulator pack's `mode_N.ps` shaders (1: 1.1, 2: 2.0, 3: 1.5, 4: 1.3,
+   5: 1.35, 6: 1.36, 7: 2.4, 14: 2.0; others 1.0). The light here is our own
+   stand-in (the peak of the polygon's luma table times its luma), so
+   brightness may differ from the emulator.
+6. **The rasterizer wraps texture addresses by the texture size whatever the
+   wrap bits say** (they only stop edge blending). Clamping UVs when the wrap
+   bits were off turned the start line billboard black (its UVs run 137 to 256
+   on a 128 texture). Repeat everywhere, clamp only inside 0..1.
+7. **Draw order does not need the painter's algorithm.** Polygons are drawn
+   with the depth test ("first fill wins"), so polygons can be regrouped by
+   picture to cut texture binds without changing the image. Only done when a
+   pack picture is in use, so the off path stays untouched.
+8. **Anisotropic filtering matters** for the road at grazing angles (it
+   smears horizontally without it), and needs the SDL_GPU device feature
+   requested at creation. Desktop asks for it; mobile still opts out.
+9. **The pack's own bug:** `_mode_14.ps` in stf999's emulator folder lacks its
+   final `}`; renamed to `mode_14.ps` the emulator exits with code 5.
+10. **Running the original emulator on Linux** (for comparison): Wine with
+    DXVK, the m2emulator-format `daytona.zip` (MAME sets lack three ROMs),
+    `FullMode=4` with a custom resolution in `EMULATOR.INI`, and gamescope,
+    because the emulator's own fullscreen renders into a corner of the screen
+    under Wayland.
+
+**Not done or not checked:** the 1993 set, other packs, courses beyond the
+beginner circuit, Windows, macOS, D3D12, Metal, Vita and mobile builds; the
+coloured modes' brightness against the emulator; the game's microtexture on
+replaced polygons (lost); a tool to list the IDs of the textures a frame draws.
+
 ## Licence
 
 This project's own code is under the [BSD-3-Clause licence](LICENSE): use,
@@ -176,3 +288,4 @@ notice (in the source, and in the documentation of builds you distribute).
 Code from other projects keeps its own licence and notices; see
 [THIRD_PARTY.md](THIRD_PARTY.md). The licence does not cover Daytona USA
 itself: the ROMs and the code generated from them are never distributed.
+The texture pack is stf999's work and is not part of this repository.

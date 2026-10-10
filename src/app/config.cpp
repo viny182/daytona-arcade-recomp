@@ -39,6 +39,8 @@ void Config::load() {
         else if (k == "draw_distance") draw_distance = std::clamp(std::atoi(v.c_str()), -2, 2);
         else if (k == "draw_mode") draw_mode = std::clamp(std::atoi(v.c_str()), 0, 2);
         else if (k == "supersampling") supersampling = std::clamp(std::atoi(v.c_str()), 1, 4);
+        else if (k == "texture_pack_on") texture_pack_on = v == "1";
+        else if (k == "texture_pack") texture_pack = v;
         else if (k == "volume") volume = std::clamp(std::strtof(v.c_str(), nullptr), 0.0f, 1.0f);
         else if (k == "mute") mute = v == "1";
         else if (k == "fullscreen_mode") fullscreen_mode = v;
@@ -85,6 +87,8 @@ void Config::save() const {
     f << "draw_distance=" << draw_distance << "\n";
     f << "draw_mode=" << draw_mode << "\n";
     f << "supersampling=" << supersampling << "\n";
+    f << "texture_pack_on=" << (texture_pack_on ? 1 : 0) << "\n";
+    f << "texture_pack=" << texture_pack << "\n";
     f << "volume=" << volume << "\n";
     f << "mute=" << (mute ? 1 : 0) << "\n";
     f << "fullscreen_mode=" << fullscreen_mode << "\n";

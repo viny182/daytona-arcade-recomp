@@ -1,6 +1,7 @@
 #include "app/gpu/gpu_renderer.h"
 
 #include "app/gpu/shaders_gen.h"
+#include "runtime/texid.h"
 
 #include <algorithm>
 #include <cmath>
@@ -57,7 +58,7 @@ bool GpuRenderer::init(SDL_GPUDevice *dev, SDL_GPUTextureFormat format) {
     SDL_GPUShader *vs_poly = shader(k_vs_poly_spv, sizeof k_vs_poly_spv, k_vs_poly_dxil, sizeof k_vs_poly_dxil,
                                     k_vs_poly_msl, "vs_poly", SDL_GPU_SHADERSTAGE_VERTEX, 1, 0);
     SDL_GPUShader *ps_poly = shader(k_ps_poly_spv, sizeof k_ps_poly_spv, k_ps_poly_dxil, sizeof k_ps_poly_dxil,
-                                    k_ps_poly_msl, "ps_poly", SDL_GPU_SHADERSTAGE_FRAGMENT, 0, 0, 3);
+                                    k_ps_poly_msl, "ps_poly", SDL_GPU_SHADERSTAGE_FRAGMENT, 0, 1, 3);
     SDL_GPUShader *vs_quad = shader(k_vs_quad_spv, sizeof k_vs_quad_spv, k_vs_quad_dxil, sizeof k_vs_quad_dxil,
                                     k_vs_quad_msl, "vs_quad", SDL_GPU_SHADERSTAGE_VERTEX, 1, 0);
     SDL_GPUShader *ps_quad = shader(k_ps_quad_spv, sizeof k_ps_quad_spv, k_ps_quad_dxil, sizeof k_ps_quad_dxil,
@@ -150,6 +151,16 @@ bool GpuRenderer::init(SDL_GPUDevice *dev, SDL_GPUTextureFormat format) {
     smp.address_mode_u = smp.address_mode_v = smp.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
     sampler_ = SDL_CreateGPUSampler(dev_, &smp);
 
+    set_pack_anisotropy(1.0f); // trilinear: the pictures' sampler
+    SDL_GPUTextureCreateInfo blank{};
+    blank.type = SDL_GPU_TEXTURETYPE_2D;
+    blank.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+    blank.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
+    blank.width = blank.height = 1;
+    blank.layer_count_or_depth = 1;
+    blank.num_levels = 1;
+    blank_ = SDL_CreateGPUTexture(dev_, &blank); // never sampled: the shader reads it only for polygons with a picture
+
     SDL_GPUBufferCreateInfo qb{};
     qb.usage = SDL_GPU_BUFFERUSAGE_VERTEX;
     qb.size = sizeof(QuadVertex) * 6;
@@ -166,7 +177,7 @@ bool GpuRenderer::init(SDL_GPUDevice *dev, SDL_GPUTextureFormat format) {
     tilepix_ = SDL_CreateGPUBuffer(dev_, &sb);
     sb.size = kTileDataWords * 4;
     tiledata_ = SDL_CreateGPUBuffer(dev_, &sb);
-    if (!sampler_ || !qbuf_ || !texram_ || !luma_ || !xlat_ || !tilepix_ || !tiledata_) {
+    if (!sampler_ || !pack_sampler_ || !blank_ || !qbuf_ || !texram_ || !luma_ || !xlat_ || !tilepix_ || !tiledata_) {
         error_ = std::string("SDL_GPU setup: ") + SDL_GetError();
         shutdown();
         return false;
@@ -180,6 +191,9 @@ void GpuRenderer::shutdown() {
     for (SDL_GPUGraphicsPipeline **p : {&quad_pipe_, &back_pipe_, &front_pipe_})
         if (*p) SDL_ReleaseGPUGraphicsPipeline(dev_, *p), *p = nullptr;
     if (sampler_) SDL_ReleaseGPUSampler(dev_, sampler_), sampler_ = nullptr;
+    set_texture_pack(nullptr);
+    if (pack_sampler_) SDL_ReleaseGPUSampler(dev_, pack_sampler_), pack_sampler_ = nullptr;
+    if (blank_) SDL_ReleaseGPUTexture(dev_, blank_), blank_ = nullptr;
     if (front_) SDL_ReleaseGPUTexture(dev_, front_), front_ = nullptr;
     if (depth_) SDL_ReleaseGPUTexture(dev_, depth_), depth_ = nullptr;
     if (vbuf_) SDL_ReleaseGPUBuffer(dev_, vbuf_), vbuf_ = nullptr;
@@ -191,6 +205,149 @@ void GpuRenderer::shutdown() {
     if (upload_) SDL_ReleaseGPUTransferBuffer(dev_, upload_), upload_ = nullptr;
     vbuf_size_ = upload_size_ = 0;
     depth_w_ = depth_h_ = front_w_ = front_h_ = 0;
+}
+
+// A texture pack's pictures are sampled repeating (the shader holds a picture's
+// edge texel where its polygon doesn't wrap), trilinear, anisotropic if asked.
+void GpuRenderer::set_pack_anisotropy(float max) {
+    if (!dev_) return;
+    SDL_GPUSamplerCreateInfo psmp{};
+    psmp.min_filter = psmp.mag_filter = SDL_GPU_FILTER_LINEAR;
+    psmp.mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_LINEAR;
+    psmp.address_mode_u = psmp.address_mode_v = psmp.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_REPEAT;
+    psmp.max_lod = 1000.0f;
+    psmp.enable_anisotropy = max > 1.0f;
+    psmp.max_anisotropy = std::max(max, 1.0f);
+    SDL_GPUSampler *sampler = SDL_CreateGPUSampler(dev_, &psmp);
+    if (!sampler) return; // keep the one in use
+    if (pack_sampler_) SDL_ReleaseGPUSampler(dev_, pack_sampler_);
+    pack_sampler_ = sampler;
+}
+
+void GpuRenderer::set_texture_pack(const TexPack *pack) {
+    if (dev_)
+        for (PackTexture &t : pack_tex_)
+            if (t.tex) SDL_ReleaseGPUTexture(dev_, t.tex);
+    pack_tex_.clear();
+    pack_ids_.clear();
+    pack_ids_generation_ = ~0ull;
+    pack_polygons_ = pack_resident_ = 0;
+    pack_ = pack;
+    if (pack_) pack_tex_.resize(pack_->size());
+}
+
+// The pack entry for a textured polygon's ID pair, or -1. The pair is worked out
+// once per texture and texture RAM generation: texture RAM rarely changes.
+int GpuRenderer::pack_entry(const rt::VideoMem &mem, uint16_t th0, uint16_t th2) {
+    if (!mem.tex0 || !mem.tex1) return -1;
+    if (mem.tex_generation != pack_ids_generation_) {
+        pack_ids_.clear();
+        pack_ids_generation_ = mem.tex_generation;
+    }
+    const uint32_t id1 = rt::tex_id1(th0, th2); // holds everything the second ID reads: size, place, sheet
+    const auto it = pack_ids_.find(id1);
+    if (it != pack_ids_.end()) return it->second;
+    const int entry = pack_->find(id1, rt::tex_id2((th2 & 0x1000) ? mem.tex1 : mem.tex0, th0, th2));
+    pack_ids_.emplace(id1, entry);
+    return entry;
+}
+
+// Decodes entry's picture and uploads it with its mip levels. False (and the
+// entry given up on) if it can't be read or made.
+bool GpuRenderer::pack_texture(SDL_GPUCommandBuffer *cmd, int entry) {
+    PackTexture &pt = pack_tex_[size_t(entry)];
+    TexPack::Image img;
+    std::string err;
+    if (!pack_->image(size_t(entry), img, err)) {
+        SDL_Log("texture pack: %s", err.c_str());
+        pt.failed = true;
+        return false;
+    }
+    uint32_t levels = 1;
+    for (uint32_t m = std::max(img.w, img.h); m > 1; m >>= 1) levels++;
+    SDL_GPUTextureCreateInfo ti{};
+    ti.type = SDL_GPU_TEXTURETYPE_2D;
+    ti.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+    ti.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER | SDL_GPU_TEXTUREUSAGE_COLOR_TARGET; // the target usage is for the mip levels
+    ti.width = img.w;
+    ti.height = img.h;
+    ti.layer_count_or_depth = 1;
+    ti.num_levels = levels;
+    SDL_GPUTexture *tex = SDL_CreateGPUTexture(dev_, &ti);
+    SDL_GPUTransferBufferCreateInfo tbi{};
+    tbi.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
+    tbi.size = Uint32(img.rgba.size());
+    SDL_GPUTransferBuffer *tb = tex ? SDL_CreateGPUTransferBuffer(dev_, &tbi) : nullptr;
+    void *dst = tb ? SDL_MapGPUTransferBuffer(dev_, tb, false) : nullptr;
+    if (!dst) {
+        SDL_Log("texture pack: %s: %s", pack_->entry(size_t(entry)).path.c_str(), SDL_GetError());
+        if (tb) SDL_ReleaseGPUTransferBuffer(dev_, tb);
+        if (tex) SDL_ReleaseGPUTexture(dev_, tex);
+        pt.failed = true;
+        return false;
+    }
+    std::memcpy(dst, img.rgba.data(), img.rgba.size());
+    SDL_UnmapGPUTransferBuffer(dev_, tb);
+    SDL_GPUCopyPass *copy = SDL_BeginGPUCopyPass(cmd);
+    SDL_GPUTextureTransferInfo src{};
+    src.transfer_buffer = tb;
+    SDL_GPUTextureRegion region{};
+    region.texture = tex;
+    region.w = img.w;
+    region.h = img.h;
+    region.d = 1;
+    SDL_UploadToGPUTexture(copy, &src, &region, false);
+    SDL_EndGPUCopyPass(copy);
+    SDL_GenerateMipmapsForGPUTexture(cmd, tex);
+    SDL_ReleaseGPUTransferBuffer(dev_, tb); // freed once the GPU is done with it
+    pt.tex = tex;
+    pack_resident_++;
+    return true;
+}
+
+// With a pack: the polygons that have a picture ready, and their vertices
+// marked for the shader and gathered by (clip rectangle, picture). The depth
+// test keeps the rasterizer's order whatever order they are drawn in. Pictures
+// not ready yet (decoding takes a few frames) leave their polygons as they were.
+void GpuRenderer::regroup(SDL_GPUCommandBuffer *cmd) {
+    pack_polygons_ = 0;
+    if (!pack_ || recs_.empty()) return;
+    int uploads = 0;
+    bool any = false;
+    for (PolyRec &r : recs_) {
+        if (r.pack < 0) continue;
+        PackTexture &pt = pack_tex_[size_t(r.pack)];
+        if (!pt.tex && !pt.failed && uploads < pack_uploads_) {
+            uploads++;
+            pack_texture(cmd, r.pack);
+        }
+        if (!pt.tex) {
+            r.pack = -1;
+            continue;
+        }
+        any = true;
+        pack_polygons_++;
+        const uint32_t bits = 1u << 23 | uint32_t(pack_->entry(size_t(r.pack)).mode & 15) << 24;
+        for (uint32_t k = r.first; k < r.first + r.count; k++) verts_[k].info[0] |= bits;
+    }
+    if (!any) return;
+    std::stable_sort(recs_.begin(), recs_.end(), [](const PolyRec &a, const PolyRec &b) {
+        if (a.clip.x != b.clip.x) return a.clip.x < b.clip.x;
+        if (a.clip.y != b.clip.y) return a.clip.y < b.clip.y;
+        if (a.clip.w != b.clip.w) return a.clip.w < b.clip.w;
+        if (a.clip.h != b.clip.h) return a.clip.h < b.clip.h;
+        return a.pack < b.pack;
+    });
+    regrouped_.clear();
+    regrouped_.reserve(verts_.size());
+    batches_.clear();
+    for (const PolyRec &r : recs_) {
+        if (batches_.empty() || batches_.back().pack != r.pack || std::memcmp(&batches_.back().clip, &r.clip, sizeof r.clip) != 0)
+            batches_.push_back({uint32_t(regrouped_.size()), 0, r.clip, r.pack});
+        regrouped_.insert(regrouped_.end(), verts_.begin() + r.first, verts_.begin() + r.first + r.count);
+        batches_.back().count = uint32_t(regrouped_.size()) - batches_.back().first;
+    }
+    verts_.swap(regrouped_);
 }
 
 // Textures and buffers big enough for this frame.
@@ -246,6 +403,7 @@ bool GpuRenderer::ensure(int w, int h, int scale, uint32_t vert_bytes) {
 void GpuRenderer::build(const rt::Video &video, int w, int h, int scale) {
     verts_.clear();
     batches_.clear();
+    recs_.clear();
     const std::vector<rt::GeoPoly> &polys = video.gpu_polys();
     const rt::VideoMem &mem = video.gpu_mem();
     const int windows = video.gpu_windows();
@@ -328,6 +486,15 @@ void GpuRenderer::build(const rt::Video &video, int w, int h, int scale) {
         info[3] = ((th1 & 0xff) << 7) | uint32_t(poly.luma) << 16;
         more[0] = uint32_t(poly.texlod + lod_bias);
         more[1] = le16(mem.palram, colorbase + 0x1000) & 0x7fff;
+        // a texture pack picture, if the polygon has one (textured renderers 2, 3)
+        const int entry = pack_ && (renderer & 2) && mem.lumaram ? pack_entry(mem, poly.texheader[0], poly.texheader[2]) : -1;
+        if (entry >= 0) {
+            // A coloured picture is lit by the brightest its polygon's luma table
+            // makes a texel (m2.hlsl ps_poly), 0..63 in bits 16..21 of more[1].
+            uint32_t peak = 0;
+            for (uint32_t i = 0; i < 128; i++) peak = std::max<uint32_t>(peak, mem.lumaram[((info[3] & 0xffff) + i) * 4]);
+            more[1] |= std::min(uint32_t(peak * poly.luma / 256) & 0xff, 0x3fu) << 16;
+        }
 
         // model2_3d_project, then a fan from vertex 0 (the polygon is convex)
         PolyVertex v[8];
@@ -339,12 +506,14 @@ void GpuRenderer::build(const rt::Video &video, int w, int h, int scale) {
                     ooz, g0.p[1] * ooz * (1.0f / 8.0f), g0.p[2] * ooz * (1.0f / 8.0f),
                     r, g, b, 1.0f, {info[0], info[1], info[2], info[3]}, {more[0], more[1]}};
         }
+        const uint32_t poly_first = uint32_t(verts_.size());
         for (int k = 1; k + 1 < poly.num_vertices; k++) {
             verts_.push_back(v[0]);
             verts_.push_back(v[k]);
             verts_.push_back(v[k + 1]);
         }
         batches_.back().count = uint32_t(verts_.size()) - batches_.back().first;
+        if (pack_) recs_.push_back({poly_first, uint32_t(verts_.size()) - poly_first, clip, entry});
     }
 }
 
@@ -353,6 +522,7 @@ void GpuRenderer::render(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *target, int 
     if (!ok()) return;
     scale = std::clamp(scale, 1, 4);
     build(video, w, h, scale);
+    regroup(cmd);
     const uint32_t vert_bytes = uint32_t(verts_.size() * sizeof(PolyVertex));
     if (!ensure(w, h, scale, vert_bytes)) return;
 
@@ -508,8 +678,15 @@ void GpuRenderer::render(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *target, int 
         SDL_BindGPUVertexBuffers(pass, 0, &vb, 1);
         SDL_GPUBuffer *storage[3] = {texram_, luma_, xlat_};
         SDL_BindGPUFragmentStorageBuffers(pass, 0, storage, 3);
+        SDL_GPUTexture *bound = nullptr; // the pipeline reads a picture slot: a pack's, or the blank one
         for (const Batch &b : batches_) {
             if (!b.count) continue;
+            SDL_GPUTexture *picture = b.pack >= 0 ? pack_tex_[size_t(b.pack)].tex : blank_;
+            if (picture != bound) {
+                const SDL_GPUTextureSamplerBinding tsb{picture, pack_sampler_};
+                SDL_BindGPUFragmentSamplers(pass, 0, &tsb, 1);
+                bound = picture;
+            }
             const SDL_Rect clip{b.clip.x * scale, b.clip.y * scale, b.clip.w * scale, b.clip.h * scale};
             SDL_SetGPUScissor(pass, &clip);
             SDL_DrawGPUPrimitives(pass, b.count, 1, b.first, 0);

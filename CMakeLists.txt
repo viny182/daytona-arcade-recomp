@@ -221,7 +221,7 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/extern/sdl3/CMakeLists.txt)
         target_compile_options(imgui PRIVATE -w)
     endif()
     # The hardware renderer (SDL_GPU), shared by the app and m2gpushot.
-    add_library(gpurender STATIC src/app/gpu/gpu_renderer.cpp)
+    add_library(gpurender STATIC src/app/gpu/gpu_renderer.cpp src/app/gpu/texpack.cpp)
     target_include_directories(gpurender PUBLIC src)
     target_link_libraries(gpurender PUBLIC runtime ${M2_SDL_TARGET})
     add_library(daytona_app OBJECT src/app/main.cpp src/app/launcher.cpp src/app/config.cpp src/app/controls.cpp src/app/ffb.cpp src/app/link_socket.cpp src/app/pacing.cpp)
@@ -338,6 +338,11 @@ add_executable(test_geo_clip tests/test_geo_clip.cpp)
 target_include_directories(test_geo_clip PRIVATE src)
 add_test(NAME geo_clip COMMAND test_geo_clip)
 
+# Texture pack identity (ID pair of a texture, as .pat files name it).
+add_executable(test_texid tests/test_texid.cpp)
+target_include_directories(test_texid PRIVATE src)
+add_test(NAME texid COMMAND test_texid)
+
 add_executable(test_geo_stream tests/test_geo_stream.cpp)
 target_include_directories(test_geo_stream PRIVATE src)
 add_test(NAME geo_stream COMMAND test_geo_stream)
@@ -380,6 +385,14 @@ add_test(NAME native_sound_sequencer COMMAND test_native_sound_sequencer)
 add_executable(test_comm_board tests/test_comm_board.cpp src/runtime/comm_board.cpp)
 target_include_directories(test_comm_board PRIVATE src)
 add_test(NAME comm_board COMMAND test_comm_board)
+
+# Texture pack loading: the .pat format and PNG decoding (SDL).
+if(TARGET gpurender)
+    add_executable(test_texpack tests/test_texpack.cpp)
+    target_include_directories(test_texpack PRIVATE src)
+    target_link_libraries(test_texpack PRIVATE gpurender)
+    add_test(NAME texpack COMMAND test_texpack)
+endif()
 
 # Wheel and pedal bindings against SDL virtual joysticks.
 if(TARGET SDL3::SDL3-static)

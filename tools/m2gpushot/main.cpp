@@ -4,12 +4,15 @@
 //
 //   m2gpushot IMAGES_DIR FRAMES --dump DIR --every N [--inputs scripts/inputs/X.txt]
 //             [--aspect W:H [--hud-edges] [--stretch-backdrop]] [--scale N] [--nvram DIR]
+//             [--texture-pack DIR]
 //   m2gpushot IMAGES_DIR FRAMES --bench [--inputs ...] [--aspect ...] [--scale N]
 //
 // --scale N: the internal resolution enhancement (1-4); dumps are N times
 // wider and taller. --nvram DIR: start from the game's saved settings EEPROM
 // and backup RAM (ioboard_eeprom.bin, backup_ram.bin, as the app saves them
-// in its data folder), e.g. a cabinet type set in test mode.
+// in its data folder), e.g. a cabinet type set in test mode. --texture-pack DIR:
+// a texture pack's folder (gpu/texpack.h), every picture ready from the first
+// frame, so the same frames can be compared with and without it.
 //
 // --bench draws every frame through the GPU, with no readback, and reports
 // the time in the game (logic, geometrizer, CPU tilemap layers), in the
@@ -31,6 +34,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 int main(int argc, char **argv) {
     if (argc < 3) {
@@ -39,7 +43,7 @@ int main(int argc, char **argv) {
     }
     const std::string dir = argv[1];
     const uint64_t frames = std::strtoull(argv[2], nullptr, 10);
-    std::string dump_dir, inputs_path, nvram_dir;
+    std::string dump_dir, inputs_path, nvram_dir, pack_dir;
     uint64_t every = 0;
     int scale = 1;
     double aspect = 0;
@@ -60,6 +64,7 @@ int main(int argc, char **argv) {
         else if (!std::strcmp(argv[i], "--every")) every = std::strtoull(argv[i + 1], nullptr, 10);
         else if (!std::strcmp(argv[i], "--inputs")) inputs_path = argv[i + 1];
         else if (!std::strcmp(argv[i], "--nvram")) nvram_dir = argv[i + 1];
+        else if (!std::strcmp(argv[i], "--texture-pack")) pack_dir = argv[i + 1];
         else if (!std::strcmp(argv[i], "--scale")) scale = std::clamp(std::atoi(argv[i + 1]), 1, 4);
     }
     if (!bench && (dump_dir.empty() || !every)) {
@@ -81,6 +86,20 @@ int main(int argc, char **argv) {
     if (!gpu.init(dev, SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM)) {
         std::fprintf(stderr, "m2gpushot: %s\n", gpu.error().c_str());
         return 1;
+    }
+    app::TexPack pack;
+    if (!pack_dir.empty()) {
+        std::string err;
+        std::vector<std::string> sets{M2_ROMSET};
+        if (sets[0] == "daytona93") sets = {"dayton93", "daytona93", "daytona"};
+        if (!pack.load(pack_dir, sets, err)) {
+            std::fprintf(stderr, "m2gpushot: texture pack: %s\n", err.c_str());
+            return 1;
+        }
+        std::printf("m2gpushot: texture pack: %zu pictures from %s\n", pack.size(), pack.pat_path().c_str());
+        gpu.set_texture_pack(&pack);
+        gpu.set_pack_uploads_per_frame(100000);
+        gpu.set_pack_anisotropy(16.0f); // this device has every feature
     }
     constexpr int H = rt::GameLoop::kHeight;
     const int W = rt::GameLoop::kWidth + 2 * rt::GameLoop::wide_margin(aspect);

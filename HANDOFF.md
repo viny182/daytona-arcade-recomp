@@ -1,5 +1,75 @@
 # Handoff
 
+## Texture packs for the hardware renderer (2026-10-10)
+
+Opt-in replacement textures from a Model 2 emulator style pack (`<set>.pat`
+and PNG files, the user's own). Published in a fork (see README); not offered upstream.
+docs/texture-packs.md is the user's page; the design doc's enhancements table
+has the row. Design sections relied on: Geometry and rendering, Enhancements
+(off by default, one shader path).
+
+State: complete for the 1994 set on the desktop hardware renderer, launcher
+option (Game tab), `--texture-pack DIR`, `m2gpushot --texture-pack DIR`.
+Tests texid and texpack are new; ctest runs 18 of 20, the two Lua tests skip
+(no Lua here), all 18 pass.
+With the pack off the output is byte-identical to HEAD (m2gpushot, 8 frames,
+2x, 16:9, HUD at the edges, attract and race_basic). Pack on, same inputs:
+renderer CPU 0.20 ms to 0.29 ms a frame, waiting for the GPU 1.65 to 1.02 ms
+(noise); 474 frames/s headless, AMD Rembrandt iGPU.
+
+How the IDs were established (the part that took the time):
+1. ID1 = texheader[2] << 16 | texheader[0] & 0xE03F. Found by matching the
+   `.pat`'s ID1 values to headers of textured polygons: bits 6 to 12 of
+   texheader[0] never appear in the pack's IDs; 0xFB3F, 0xF33F and 0xE33F all
+   fit the first 437, 0xE03F fits every ID1 in the pack.
+2. ID2 was not any common hash of the decoded 4-bit texels (crc32, adler,
+   fnv, sums, in about 40 orderings and expansions, 105 certain pairs: no hit).
+   Matching pack PNGs to dumped textures by image correlation gave the pairs
+   but not the function. Reading the CRC loop in the Model 2 emulator
+   (EMULATOR.EXE 1.1a, a freely distributed binary, no source) showed zlib's
+   CRC-32 over the sheet's raw bytes, 2 x width bytes per pair of texel rows,
+   0x400 bytes between pairs. Over the dumped textures 437 of 437 then had
+   their ID2 in the pack. That is the only use of the emulator's code: a
+   constant (poly 0xEDB88320) and a length and stride, no code copied.
+   The README says so; the formula can be re-checked against any pack.
+
+Findings that went wrong first, and why:
+- Clamping a polygon's coordinates to the picture when its wrap bits are off
+  turned a billboard black: its u, v run 137 to 256 on a 128 texture. The
+  rasterizer wraps addresses by the size whatever the wrap bits say (they only
+  stop edge blending). The shader now repeats, clamping only inside 0..1.
+- Lighting a coloured picture by "a white texel" (luma table index 120) also
+  blacked that billboard: its table is not bright there. The CPU now takes the
+  table's peak (128 entries) times the polygon's luma, through the colour table.
+- Anisotropic sampling needs the device feature; the app had opted out of it
+  (Mali). Desktop keeps it now (gpu_device.h parameter, mobile still off),
+  and the renderer's sampler uses it where asked (road at grazing angles was
+  smeared horizontally without it).
+- stf999's `_mode_14.ps` (emulator folder) lacks its final `}`; renamed to
+  mode_14.ps it makes the emulator exit with code 5. Not our shader.
+
+Not done, or only guessed:
+- The coloured modes' gains come from the emulator's mode_N.ps, applied to a
+  light that is our own stand-in for its LightMap.r. Compare a few surfaces
+  against the emulator before trusting the brightness. Modes 8 to 13 and 15
+  have no shader in the pack; they use gain 1.0.
+- Only the 1994 set, one pack, attract mode and a race start were looked at.
+  The 1993 set tries dayton93.pat, daytona93.pat, daytona.pat in that order.
+- Replaced polygons lose the microtexture; translucent ones use the picture's
+  alpha (below one half discarded), not the game's.
+- Not built or run: Vita, mobile, Windows, macOS, D3D12, Metal (the shader
+  is regenerated for all three by scripts/build_shaders.py, DXC 1.9.2609 and
+  SPIRV-Cross; the toolchain reproduced the old shaders_gen.h byte for byte
+  before the change; the new SPIR-V's bindings were read with spirv-cross).
+- A tool to list the IDs of the textures a frame draws (so pack authors need
+  not run the emulator's dump) would be small: tex_id1/tex_id2 per polygon.
+
+What not to re-propose: hashing the decoded texels; correlating pictures to
+find identities; one texture array for the pictures (their sizes differ, 933
+by 933 among them, and draws grouped by picture are cheap); re-sorting the
+polygons for anything but grouping (the depth test makes the order free, but
+only when a pack picture is in use, so the off path stays untouched).
+
 ## Mobile upstream rebase and GPU startup diagnostics (2026-10-07)
 
 Rebased mobile onto original alphanu1 upstream/main 0435a46; recovery branch
